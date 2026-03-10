@@ -2,14 +2,19 @@ import uuid
 import time
 import functools
 import threading
+import statistics
+import hashlib
 
 # Thread-local storage to track spans within a single request/execution thread
 _context = threading.local()
 
 class SDKTracer:
 
-    def __init__(self, telemetry):
+    def __init__(self, telemetry, environment="prod", model="unknown", provider="unknown"):
         self.telemetry = telemetry
+        self.environment = environment
+        self.model = model
+        self.provider = provider
 
     def start_trace(self):
         """Initializes a new span list for the current thread."""
@@ -112,43 +117,104 @@ class SDKTracer:
             return wrapper
         return decorator
 
-    def export_trace(self, result, query=None, session_id=None, user_id=None, timestamp=None, include_spans=True, exclude_span_names=None):
-        trace_id = result.get("trace_id") or f"trace-{uuid.uuid4().hex[:8]}"
-        if exclude_span_names is None:
-            exclude_span_names = [] # Include all spans by default, let them be "thin"
+    def export_trace(self, output, query=None, session_id=None, user_id=None, timestamp=None, rag_docs=None):
+        """Autonomous trace assembly (LangFuse style)."""
         
-        # Collect and filter spans
-        combined_spans = []
-        if include_spans:
-            collected = getattr(_context, 'spans', [])
-            explicit = result.get("spans") or []
-            for s in (collected + explicit):
-                if s.get("name") not in exclude_span_names:
-                    combined_spans.append(s)
+        # 1. Handle legacy dict or new raw output
+        if isinstance(output, dict) and "output" in output:
+            # Legacy/Hybrid support
+            result_data = output
+            answer = output.get("output")
+        else:
+            result_data = {}
+            answer = output
 
-        # Build compatibility structure
+        trace_id = result_data.get("trace_id") or f"trace-{uuid.uuid4().hex[:8]}"
+        
+        # 2. Extract spans and analyze them for metrics
+        collected_spans = getattr(_context, 'spans', [])
+        
+        intent = result_data.get("intent")
+        routing_decision = result_data.get("routing_decision")
+        provider_raw = result_data.get("provider_raw")
+        
+        # Scan spans for missing info
+        retrieval_span = next((s for s in collected_spans if s.get("name") == "vector-search"), None)
+        llm_span = next((s for s in collected_spans if s.get("type") == "llm"), None)
+        intent_span = next((s for s in collected_spans if s.get("type") == "intent-classification"), None)
+
+        if not intent and intent_span:
+            intent = intent_span.get("metadata", {}).get("intent")
+            
+        if not provider_raw and llm_span:
+            provider_raw = llm_span.get("usage")
+
+        # 3. Calculate Retrieval Metrics (Self-Assembly)
+        rag_data = result_data.get("rag_data")
+        retrieval_confidence = result_data.get("retrieval_confidence", 0)
+        documents_found = result_data.get("documents_found", 0)
+        
+        if not rag_data and rag_docs:
+            scores = [float(score) for _, score in rag_docs]
+            documents_found = len(rag_docs)
+            
+            # Confidence Math migrated from RAGEngine
+            if scores:
+                avg_score = statistics.mean(scores)
+                coverage = min(len(scores) / 3, 1)
+                std_score = statistics.pstdev(scores) if len(scores) > 1 else 0
+                consistency = 1 / (1 + std_score)
+                retrieval_confidence = round(0.6 * avg_score + 0.25 * coverage + 0.15 * consistency, 4)
+            
+            rag_data = {
+                "documents_found": documents_found,
+                "retrieval_scores": {
+                    "avg_score": statistics.mean(scores) if scores else 0,
+                    "min_score": min(scores) if scores else 0,
+                    "max_score": max(scores) if scores else 0,
+                    "std_score": statistics.pstdev(scores) if len(scores) > 1 else 0,
+                    "per_doc_scores": [round(s, 4) for s in scores]
+                },
+                "retrieved_documents": [
+                    {
+                        "doc_id": hashlib.md5(doc.page_content.encode()).hexdigest()[:8],
+                        "score": round(float(score), 4),
+                        "content_preview": doc.page_content[:200]
+                    }
+                    for doc, score in rag_docs
+                ]
+            }
+
+        # Determine trace name if not provided
+        trace_name = result_data.get("trace_name")
+        if not trace_name:
+            if routing_decision == "out_of_scope": trace_name = "out-of-scope-qa"
+            elif intent == "greeting": trace_name = "simple-qa"
+            else: trace_name = "rag-qa"
+
+        # 4. Build Final "Ideal" Schema
         trace = {
             "id": trace_id,
             "partitionKey": trace_id,
             "trace_id": trace_id,
-            "trace_name": result.get("trace_name", "rag-qa"),
+            "trace_name": trace_name,
             "session_id": session_id,
             "user_id": user_id,
             "timestamp": timestamp or int(time.time() * 1000),
-            "environment": result.get("environment", "prod"),
-            "intent": result.get("intent"),
-            "routing_decision": result.get("routing_decision"),
-            "provider": result.get("provider", "groq"),
-            "model": result.get("model", "llama-3.1-8b-instant"),
+            "environment": result_data.get("environment", self.environment),
+            "intent": intent,
+            "routing_decision": routing_decision,
+            "provider": result_data.get("provider", self.provider),
+            "model": result_data.get("model", self.model),
             "input": {"query": query},
-            "output": {"answer": result.get("output")},
-            "latency_ms": result.get("latency_ms"),
-            "documents_found": result.get("documents_found"),
-            "retrieval_executed": result.get("retrieval_executed"),
-            "retrieval_confidence": result.get("retrieval_confidence"),
-            "rag_data": result.get("rag_data"),
-            "spans": combined_spans,
-            "provider_raw": result.get("provider_raw") if isinstance(result.get("provider_raw"), dict) else self._safe_serialize(result.get("provider_raw"), max_length=500),
+            "output": {"answer": answer},
+            "latency_ms": result_data.get("latency_ms") or (collected_spans[-1]['end_time'] - collected_spans[0]['start_time'] if collected_spans else 0),
+            "documents_found": documents_found,
+            "retrieval_executed": result_data.get("retrieval_executed", intent == "search_query"),
+            "retrieval_confidence": retrieval_confidence,
+            "rag_data": rag_data,
+            "spans": collected_spans,
+            "provider_raw": provider_raw if isinstance(provider_raw, dict) else self._safe_serialize(provider_raw, max_length=500),
             "status": "success",
             "logged_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + f".{int(time.time()*1000)%1000:03d}Z"
         }

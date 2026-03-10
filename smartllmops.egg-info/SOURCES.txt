@@ -1,9 +1,0 @@
-pyproject.toml
-smartllmops/__init__.py
-smartllmops/sdk.py
-smartllmops/transport.py
-smartllmops.egg-info/PKG-INFO
-smartllmops.egg-info/SOURCES.txt
-smartllmops.egg-info/dependency_links.txt
-smartllmops.egg-info/requires.txt
-smartllmops.egg-info/top_level.txt
