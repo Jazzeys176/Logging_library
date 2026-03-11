@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import requests
 from datetime import datetime
 
 # Setup local logging
@@ -19,8 +18,7 @@ if not logger.handlers:
     logger.addHandler(file_handler)
 
 class Telemetry:
-    def __init__(self, backend_url=None, cosmos_conn=None, db_name=None, container_name=None):
-        self.backend_url = backend_url or os.getenv("BACKEND_TRACE_URL")
+    def __init__(self, cosmos_conn=None, db_name=None, container_name=None):
         
         # Cosmos configuration
         self.cosmos_conn = cosmos_conn or os.getenv("COSMOS_CONN_WRITE")
@@ -54,15 +52,7 @@ class Telemetry:
 
             # 1. Local logging
             logger.info(json.dumps(trace))
-
-            # 2. External backend
-            if self.backend_url:
-                try:
-                    requests.post(self.backend_url, json=trace, timeout=1)
-                except Exception:
-                    pass
-
-            # 3. Cosmos DB
+            # 2. Cosmos DB
             if self.container:
                 try:
                     self.container.upsert_item(body=trace)

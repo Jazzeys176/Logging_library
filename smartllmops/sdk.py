@@ -2,6 +2,8 @@ import uuid
 import time
 import functools
 import threading
+import inspect
+import asyncio
 
 # Thread-local storage to track spans within a single request/execution thread
 _context = threading.local()
@@ -72,6 +74,163 @@ class SDKTracer:
         return s
 
     # ---------------------------------------------------------
+    # SPAN EXECUTION CORE
+    # ---------------------------------------------------------
+
+    def _before_span(self, func, name, parent_span_id):
+        # AUTO TRACE START
+        if not hasattr(_context, "trace_id"):
+            self.start_trace()
+
+        span_name = name or func.__name__
+        span_id = f"span-{uuid.uuid4().hex[:8]}"
+        start_time = int(time.time() * 1000)
+
+        if not hasattr(_context, "active_span_stack"):
+            _context.active_span_stack = []
+
+        effective_parent = parent_span_id
+        if effective_parent is None and _context.active_span_stack:
+            effective_parent = _context.active_span_stack[-1]
+
+        _context.active_span_stack.append(span_id)
+        return span_id, span_name, start_time, effective_parent
+
+    def _after_span(
+        self,
+        span_id,
+        span_name,
+        start_time,
+        effective_parent,
+        status,
+        output,
+        metadata,
+        usage,
+        include_io,
+        result_parser,
+        args,
+        kwargs,
+        error_metadata,
+        span_type,
+    ):
+        if _context.active_span_stack:
+            _context.active_span_stack.pop()
+
+        end_time = int(time.time() * 1000)
+
+        if not hasattr(_context, "spans"):
+            _context.spans = []
+
+        trace_id = getattr(_context, "trace_id", None)
+
+        final_metadata = (metadata or {}).copy()
+        final_usage = (usage or {}).copy()
+
+        final_metadata.update(error_metadata or {})
+
+        if result_parser and status == "success":
+            try:
+                parsed = result_parser(output, args, kwargs)
+
+                if isinstance(parsed, dict):
+                    final_metadata.update(parsed.get("metadata", {}))
+                    final_usage.update(parsed.get("usage", {}))
+
+            except Exception as e:
+                final_metadata["_parser_error"] = str(e)
+
+        if include_io and not final_metadata:
+            final_metadata = {
+                "input": self._safe_serialize(args),
+                "output": self._safe_serialize(output),
+            }
+
+        span = {
+            "trace_id": trace_id,
+            "span_id": span_id,
+            "parent_span_id": effective_parent,
+            "type": span_type or "generic",
+            "name": span_name,
+            "start_time": start_time,
+            "end_time": end_time,
+            "latency_ms": end_time - start_time,
+            "status": status,
+            "metadata": final_metadata,
+            "usage": final_usage,
+        }
+
+        _context.spans.append(span)
+
+    def _execute_span(
+        self,
+        func,
+        args,
+        kwargs,
+        name,
+        span_type,
+        metadata,
+        usage,
+        include_io,
+        result_parser,
+        parent_span_id,
+        is_async=False,
+    ):
+        span_id, span_name, start_time, effective_parent = self._before_span(
+            func, name, parent_span_id
+        )
+
+        def finalize(status, output, error_metadata):
+            self._after_span(
+                span_id,
+                span_name,
+                start_time,
+                effective_parent,
+                status,
+                output,
+                metadata,
+                usage,
+                include_io,
+                result_parser,
+                args,
+                kwargs,
+                error_metadata,
+                span_type,
+            )
+
+        if is_async:
+
+            async def async_wrapped():
+                status = "success"
+                output = None
+                error_metadata = {}
+                try:
+                    output = await func(*args, **kwargs)
+                    return output
+                except Exception as e:
+                    status = "error"
+                    output = str(e)
+                    error_metadata = {"error": str(e), "error_type": type(e).__name__}
+                    raise
+                finally:
+                    finalize(status, output, error_metadata)
+
+            return async_wrapped()
+        else:
+            status = "success"
+            output = None
+            error_metadata = {}
+            try:
+                output = func(*args, **kwargs)
+                return output
+            except Exception as e:
+                status = "error"
+                output = str(e)
+                error_metadata = {"error": str(e), "error_type": type(e).__name__}
+                raise
+            finally:
+                finalize(status, output, error_metadata)
+
+    # ---------------------------------------------------------
     # SPAN DECORATOR
     # ---------------------------------------------------------
 
@@ -83,92 +242,53 @@ class SDKTracer:
         usage=None,
         include_io=True,
         result_parser=None,
-        parent_span_id=None
+        parent_span_id=None,
     ):
         """Decorator to capture function execution as a span."""
 
         def decorator(func):
 
-            @functools.wraps(func)
-            def wrapper(*args, **kwargs):
+            is_async = inspect.iscoroutinefunction(func)
 
-                span_name = name or func.__name__
-                span_id = f"span-{uuid.uuid4().hex[:8]}"
-                start_time = int(time.time() * 1000)
+            if is_async:
 
-                # Initialize stack if missing (e.g. decorators on classes)
-                if not hasattr(_context, "active_span_stack"):
-                    _context.active_span_stack = []
+                @functools.wraps(func)
+                async def async_wrapper(*args, **kwargs):
+                    return await self._execute_span(
+                        func,
+                        args,
+                        kwargs,
+                        name,
+                        span_type,
+                        metadata,
+                        usage,
+                        include_io,
+                        result_parser,
+                        parent_span_id,
+                        True,
+                    )
 
-                # Determine parent
-                effective_parent = parent_span_id
-                if effective_parent is None and _context.active_span_stack:
-                    effective_parent = _context.active_span_stack[-1]
+                return async_wrapper
 
-                # Push to stack
-                _context.active_span_stack.append(span_id)
+            else:
 
-                try:
-                    result = func(*args, **kwargs)
-                    status = "success"
-                    output = result
+                @functools.wraps(func)
+                def sync_wrapper(*args, **kwargs):
+                    return self._execute_span(
+                        func,
+                        args,
+                        kwargs,
+                        name,
+                        span_type,
+                        metadata,
+                        usage,
+                        include_io,
+                        result_parser,
+                        parent_span_id,
+                        False,
+                    )
 
-                except Exception as e:
-                    status = "error"
-                    output = str(e)
-                    raise e
-
-                finally:
-                    # Pop from stack
-                    if _context.active_span_stack:
-                        _context.active_span_stack.pop()
-
-                    end_time = int(time.time() * 1000)
-
-                    if not hasattr(_context, "spans"):
-                        _context.spans = []
-
-                    trace_id = getattr(_context, "trace_id", None)
-
-                    final_metadata = (metadata or {}).copy()
-                    final_usage = (usage or {}).copy()
-
-                    if result_parser and status == "success":
-                        try:
-                            parsed = result_parser(output, args, kwargs)
-
-                            if isinstance(parsed, dict):
-                                final_metadata.update(parsed.get("metadata", {}))
-                                final_usage.update(parsed.get("usage", {}))
-
-                        except Exception as e:
-                            final_metadata["_parser_error"] = str(e)
-
-                    if include_io and not final_metadata:
-                        final_metadata = {
-                            "input": self._safe_serialize(args),
-                            "output": self._safe_serialize(output),
-                        }
-
-                    span = {
-                        "trace_id": trace_id,
-                        "span_id": span_id,
-                        "parent_span_id": effective_parent,
-                        "type": span_type or "generic",
-                        "name": span_name,
-                        "start_time": start_time,
-                        "end_time": end_time,
-                        "latency_ms": end_time - start_time,
-                        "status": status,
-                        "metadata": final_metadata,
-                        "usage": final_usage,
-                    }
-
-                    _context.spans.append(span)
-
-                return result
-
-            return wrapper
+                return sync_wrapper
 
         return decorator
 
@@ -194,13 +314,14 @@ class SDKTracer:
             result_data = {}
             answer = output
 
-        trace_id = result_data.get("trace_id") or getattr(_context, "trace_id", f"trace-{uuid.uuid4().hex[:8]}")
+        trace_id = result_data.get("trace_id") or getattr(
+            _context, "trace_id", f"trace-{uuid.uuid4().hex[:8]}"
+        )
 
         collected_spans = getattr(_context, "spans", [])
 
         provider_raw = result_data.get("provider_raw")
 
-        # fallback to span usage if not provided
         if not provider_raw:
             for span in collected_spans:
                 if span.get("type") == "llm":
@@ -225,7 +346,9 @@ class SDKTracer:
             "input": {"query": query},
             "output": {"answer": answer},
             "latency_ms": latency,
-            "rag_docs": self._safe_serialize(rag_docs, max_length=1000) if rag_docs else None,
+            "rag_docs": self._safe_serialize(rag_docs, max_length=1000)
+            if rag_docs
+            else None,
             "spans": collected_spans,
             "provider_raw": provider_raw
             if isinstance(provider_raw, dict)
@@ -236,7 +359,14 @@ class SDKTracer:
             + f".{int(time.time()*1000)%1000:03d}Z",
         }
 
+        # RESET CONTEXT
         if hasattr(_context, "spans"):
             _context.spans = []
+
+        if hasattr(_context, "active_span_stack"):
+            _context.active_span_stack = []
+
+        if hasattr(_context, "trace_id"):
+            del _context.trace_id
 
         self.telemetry.log_trace(trace)
